@@ -35,7 +35,7 @@ function buscarCotacoes() {
   tbody.innerHTML = '';
 
   const moeda = document.getElementById('moeda').value;
-  fetch(`http://localhost:8080/${moeda}`)
+  fetch(`http://open.er-api.com/v6/latest/${moeda}`)
     .then(function (resp) {
       return resp.json();
     })
