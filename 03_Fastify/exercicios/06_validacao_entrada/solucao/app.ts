@@ -1,13 +1,11 @@
 import fastify from 'fastify';
-import fastifyCors from '@fastify/cors';
 
-import { consultarTarefaPeloId, cadastrarTarefa, consultarTarefas, DadosTarefa } from './tarefas/model';
 import { recuperarUsuarioAutenticado } from './usuarios/model';
 import usuariosRouter from './usuarios/router';
+import tarefasRouter from './tarefas/router';
 import { ErroNoProcessamento } from './shared/erros';
 
 const app = fastify({ logger: true });
-app.register(fastifyCors, { origin: '*' });
 
 app.setNotFoundHandler((req, resp) => {
   resp.status(404).send({ erro: 'Rota não encontrada' });
@@ -36,27 +34,8 @@ app.addHook('preHandler', async (req, resp) => {
   // pois algumas rotas podem ser públicas
 });
 
-app.post('/tarefas', async (req, resp) => {
-  const dados = req.body as DadosTarefa;
-  const id = await cadastrarTarefa(req.usuario, dados);
-  resp.status(201);
-  return { id };
-});
-
-app.get('/tarefas', async (req, resp) => {
-  const { termo } = req.query as { termo?: string };
-  const tarefas = await consultarTarefas(req.usuario, termo);
-  return tarefas;
-});
-
-app.get('/tarefas/:id', async (req, resp) => {
-  const { id } = req.params as { id: string };
-  const idTarefa = Number(id);
-  const tarefa = await consultarTarefaPeloId(req.usuario, idTarefa);
-  return tarefa;
-});
-
 app.register(usuariosRouter, { prefix: '/usuarios' });
+app.register(tarefasRouter, { prefix: '/tarefas' });
 
 async function main() {
   try {
