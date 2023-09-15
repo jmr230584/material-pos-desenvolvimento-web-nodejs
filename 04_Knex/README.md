@@ -153,7 +153,7 @@ O restante dessa disciplina irá focar no armazenamento relacional, mais especif
 O primeiro passo é garantir que você possui um servidor PostgreSQL executando. Uma opção é instalar direto na sua máquina e outra é subir um container docker da imagem oficial `postgres`. Caso opte pelo docker (recomendado), use o comando abaixo para subir o container:
 
 ```sh
-$ docker run -d --name ufscar-desenvweb-2021-1 -p 5432:5432 -e POSTGRES_PASSWORD=postgres postgres
+$ docker run -d --name ufscar-desenvweb-2023-1 -p 5432:5432 -e POSTGRES_PASSWORD=postgres postgres
 ```
 
 No momento da escrita deste material a versão estável mais recente era a 15: https://www.postgresql.org/support/versioning/.
@@ -168,19 +168,21 @@ Antes de discutir como conectar a API na base de dados, vamos criar uma tabela p
 create table usuarios (
   id int not null,
   login text not null,
+  senha text not null, /* nós vamos parar de usar texto plano em algum momento, confia :) */
   nome text not null,
+  admin boolean not null default false,
 
   constraint pk_usuarios primary key (id),
-  constraint un_usuarios unique (login)
+  constraint un_usuarios_login unique (login)
 );
 ```
 
 E depois insira os dados do Pedro e da Clara usando o seguinte DML (linguagem de manipulação de dados):
 
 ```sql
-insert into usuarios (id, login, nome)
-values (1, 'pedro', 'Pedro'),
-  (2, 'clara', 'Clara');
+insert into usuarios (id, login, senha, nome, admin)
+values (1, 'pedro', '123456', 'Pedro', false),
+  (2, 'clara', '234567', 'Clara', true);
 ```
 
 Você pode conferir se os dados foram persistidos usando a seguinte consulta:
@@ -207,11 +209,12 @@ A biblioteca Node.js para conexão com PostgreSQL é a `pg`. Vamos começar inst
 
 ```sh
 $ npm install pg
+$ npm install --save-dev @types/pg
 ```
 
-Crie agora um arquivo chamado `db.js` do lado do `app.js`. Este arquivo vai cuidar da configuração de conexão:
+Crie agora um arquivo chamado `db.ts` na pasta `shared`. Este arquivo vai cuidar da configuração de conexão:
 
-```js
+```ts
 import pg from 'pg';
 
 
@@ -219,6 +222,7 @@ export async function conectar () {
   const client = new pg.Client({
     host: 'localhost',
     port: 5432,
+    database: 'postgres',
     user: 'postgres',
     password: 'postgres'
   }); // note que tudo isso pode (e é boa prática) vir em variáveis de ambiente
@@ -227,23 +231,32 @@ export async function conectar () {
 }
 ```
 
-E agora use essa conexão no método `recuperarDadosDoUsuario` do arquivo `usuarios/model.js`:
+E agora use essa conexão no método `autenticar` do arquivo `usuarios/model.ts`:
 
 ```js
-export async function recuperarDadosDoUsuario (login) {
-  if (login === undefined) {
-    throw new UsuarioNaoAutenticado();
-  }
+import { conectar } from '../shared/db';
+
+...
+
+export async function autenticar (login: Login, senha: Senha): Promise<IdAutenticacao> {
   const conexao = await conectar();
   try {
-    const res = await conexao.query('select nome from usuarios where login = $1;', [ login ]);
-    if (res.rowCount === 0) {
-      throw new Error('Usuário não encontrado.');
+    const res = await conexao.query(
+      'select nome, senha, admin from usuarios where login = $1',
+      [ login ]
+    );
+    const row = res.rows[0];
+    if (row === undefined || row.senha !== senha) {
+      throw new DadosOuEstadoInvalido('Login ou senha inválidos', {
+        codigo: 'CREDENCIAIS_INVALIDAS'
+      });
     }
-    const usuario = res.rows[0];
-    return {
-      nome: usuario['nome']
+    const id = gerarId();
+    autenticacoes[id] = {
+      login,
+      ...row, // repare que row é do tipo any, por isso o TypeScript não reclama
     };
+    return id;
   } finally {
     await conexao.end();
   }
@@ -282,7 +295,7 @@ $ npm install sequelize
 
 Teríamos agora que instalar um driver específico do banco de dados, mas já fizemos isso na seção anterior. 
 
-Crie um arquivo `orm.js` que será responsável por expor uma instância do Sequelize configurada com os dados de conexão do banco de dados, da mesma forma que fizemos com o `db.js`:
+Crie um arquivo `shared/orm.ts` que será responsável por expor uma instância do Sequelize configurada com os dados de conexão do banco de dados, da mesma forma que fizemos com o `db.js`:
 
 ```js
 import { Sequelize } from 'sequelize';
@@ -296,31 +309,40 @@ const sequelize = new Sequelize('postgres://postgres:postgres@localhost:5432/pos
 export default sequelize;
 ```
 
-Agora adapte o arquivo `usuarios/model.js` criando a classe `Usuario`, informando os metadados necessários para o Sequelize e usando essa classe para efetuar a consulta:
+Agora adapte o arquivo `usuarios/model.ts` criando a classe `UsuarioORM`, informando os metadados necessários para o Sequelize e usando essa classe para efetuar a consulta:
 
-```js
-import sequelizeLib from 'sequelize';
-import sequelize from '../orm.js';
-//...
-const { DataTypes, Model } = sequelizeLib;
-class Usuario extends Model {}
-Usuario.init({
-  nome: DataTypes.TEXT,
-  login: DataTypes.TEXT
-}, { sequelize, modelName: 'usuarios' });
-//...
-export async function recuperarDadosDoUsuario (login) {
-  if (login === undefined) {
-    throw new UsuarioNaoAutenticado();
-  }
+```ts
+import sequelizeLib, { Model } from 'sequelize';
 
-  const usuario = await Usuario.findOne({ where: { login } });
-  if (usuario === null) {
-    throw new Error('Usuário não encontrado.');
+import sequelize from '../shared/orm';
+//...
+class UsuarioORM extends Model {
+  public id!: number;
+  public nome!: string;
+  public login!: string;
+  public senha!: string;
+  public admin!: boolean;
+}
+UsuarioORM.init({
+  nome: sequelizeLib.DataTypes.STRING,
+  login: sequelizeLib.DataTypes.STRING,
+  senha: sequelizeLib.DataTypes.STRING,
+  admin: sequelizeLib.DataTypes.BOOLEAN,
+}, {
+  sequelize,
+  tableName: 'usuarios',
+});
+//...
+export async function autenticar (login: Login, senha: Senha): Promise<IdAutenticacao> {
+  const usuario = await UsuarioORM.findOne({ where: { login } });
+  if (usuario === null || usuario.senha !== senha) {
+    throw new DadosOuEstadoInvalido('Login ou senha inválidos', {
+      codigo: 'CREDENCIAIS_INVALIDAS'
+    });
   }
-  return {
-    nome: usuario.nome
-  };
+  const id = gerarId();
+  autenticacoes[id] = usuario;
+  return id;
 }
 ```
 
@@ -340,9 +362,9 @@ $ npm install knex
 
 Note que também teríamos que instalar o driver `pg`, mas já fizemos isso.
 
-Crie agora um arquivo chamado `querybuilder.js` que ficará responsável pela configuração reutilizável:
+Crie agora um arquivo chamado `shared/querybuilder.ts` que ficará responsável pela configuração reutilizável:
 
-```js
+```ts
 import knexLib from 'knex';
 
 const knex = knexLib({
@@ -354,106 +376,136 @@ const knex = knexLib({
 export default knex;
 ```
 
-E adapte novamente o arquivo `usuarios/model.js`:
+E adapte novamente o arquivo `usuarios/model.ts`:
 
 ```js
-import knex from '../querybuilder.js';
+import knex from '../shared/querybuilder';
 //...
-const res = await knex('usuarios')
-  .select('nome')
-  .where('login', login);
-if (res.length === 0) {
-  throw new Error('Usuário não encontrado.');
-}
-return res[0];
-```
-
-Proposta de exercício: adapte o método `recuperarLoginDoUsuarioAutenticado` de modo que ele passe a consultar a informação do banco de dados. Passos necessários: 1) criar uma tabela chamada `autenticacoes` com os campos `id` (do tipo `uuid`) e `id_usuario` (do tipo `int`, com uma chave estrangeira para a tabela de usuários); 2) inserir alguns registros para testes; 3) adaptar o método no model.
-
-```sql
-create table autenticacoes (
-  id uuid not null,
-  id_usuario int not null,
-
-  constraint pk_autenticacoes primary key (id),
-  constraint fk_autenticacoes_usuario foreign key (id_usuario) references usuarios (id)
-);
-insert into autenticacoes (id, id_usuario) values ('a0b5902c-4f2d-429c-af40-38f00cddd3a6', 1);
-```
-
-```js
-export async function recuperarLoginDoUsuarioAutenticado (autenticacao) {
-  const res = await knex('usuarios')
-    .join('autenticacoes', 'autenticacoes.id_usuario', 'usuarios.id')
-    .where('autenticacoes.id', autenticacao)
-    .select('usuarios.login');
-  if (res.length === 0) {
-    throw new AutenticacaoInvalida();
+export async function autenticar (login: Login, senha: Senha): Promise<IdAutenticacao> {
+  const usuario = await knex('usuarios')
+    .select('login', 'senha', 'nome', 'admin')
+    .where({ login })
+    .first();
+  if (usuario === null || usuario.senha !== senha) {
+    throw new DadosOuEstadoInvalido('Login ou senha inválidos', {
+      codigo: 'CREDENCIAIS_INVALIDAS'
+    });
   }
-  return res[0]['login'];
+  const id = gerarId();
+  autenticacoes[id] = usuario;
+  return id;
 }
 ```
+
+Tente o exemplo passando um login inexistente. Deu um erro 500, o que aconteceu? O TypeScript está considerando o tipo de `usuario` como any, e um registro não encontrado é retornado como `undefined` ao invés de `null` pelo Knex. Mude de === null para === undefined e verá que o problema se resolve. Mas como melhorar a tipagem desse código para que problemas similares não ocorram mais?
+
+Uma maneira é ser explícito e dizer para o Knex qual o tipo esperado de retorno para a operação:
+
+```ts
+await knex<Usuario>('usuarios')
+```
+
+A outra maneira é enriquecer a interface de definição de tabelas do Knex:
+
+```ts
+declare module 'knex/types/tables' {
+  interface Tables {
+    usuarios: Usuario;
+  }
+}
+```
+
+O Knex olha nessa interface para buscar o tipo de um retorno baseado no nome da tabela que foi passado.
+
+[Exercício 01_recuperar_usuario_autenticado](exercicios/01_recuperar_usuario_autenticado/README.md)
 
 ## Adequação da função de autenticação
 
 Vamos agora adequar a função que cria autenticações validando as credenciais do usuário. Dessa vez não vamos armazenar a senha em texto plano, utilizaremos uma biblioteca que permite gerar hashes BCrypt (uma boa opção para este tipo de caso de uso). Comece instalando essa biblioteca:
 
 ```sh
-$ npm install bcryptjs
+$ npm install bcrypt
+$ npm install --save-dev @types/bcrypt
 ```
 
 Abra um console Node.js escrevendo apenas `node` no terminal. Importe a biblioteca e execute o seguinte código para encriptar uma senha:
 
 ```js
-const bcrypt = require('bcryptjs');
+const bcrypt = require('bcrypt');
 console.log(bcrypt.hashSync('123456', 8));
+console.log(bcrypt.hashSync('123456', 12));
+console.log(bcrypt.hashSync('123456', 16));
 ```
 
-Crie agora uma coluna `senha` na tabela de usuários e preencha-a com o valor obtido:
+A partir de agora a coluna `senha` na tabela de usuários *não* conterá mais as senhas em texto plano, mas sim hashes bcrypt da senha:
 
 ```sql
-alter table usuarios add senha text;
-update usuarios set senha = '$2a$08$vV2fkDIM66LxH1.8DS3sTOEE1okecuRUXIg0b4gc9umej4eVJX/Zy'; -- note que isso vai aplicar para TODOS os usuários
-alter table usuarios alter senha set not null;
+update usuarios set senha = '$2b$12$4AbaFz9KpFU2T9MZbinfFeF8qgNsOyMRl8aFxp46eEXRUBIaHfLMK'; -- note que isso vai aplicar para TODOS os usuários
 ```
 
-Por fim adeque a função `autenticar` no arquivo `usuarios/model.js`:
+Por fim adeque a função `autenticar` no arquivo `usuarios/model.ts`:
 
-```js
-import bcrypt from 'bcryptjs';
-//...
-export async function autenticar (login, senha) {
-  const res = await knex('usuarios')
-    .where('login', login)
-    .select('id', 'senha');
-  if (res.lenght === 0) {
-    throw new DadosOuEstadoInvalido('CredenciaisInvalidas', 'Credenciais inválidas.');
+```ts
+import bcrypt from 'bcrypt';
+
+...
+
+export async function autenticar (login: Login, senha: Senha): Promise<IdAutenticacao> {
+  const usuario = await knex('usuarios')
+    .select('login', 'senha', 'nome', 'admin')
+    .where({ login })
+    .first();
+  if (usuario === undefined || (await senhaInvalida(senha, usuario.senha))) {
+    throw new DadosOuEstadoInvalido('Login ou senha inválidos', {
+      codigo: 'CREDENCIAIS_INVALIDAS'
+    });
   }
-  const usuario = res[0];
-  if (!bcrypt.compareSync(senha, usuario.senha)) {
-    throw new DadosOuEstadoInvalido('CredenciaisInvalidas', 'Credenciais inválidas.');
+  const id = gerarId();
+  autenticacoes[id] = usuario;
+  return id;
+}
+
+async function senhaInvalida(senha: string, hash: string): Promise<boolean> {
+  const hashCompativel = await bcrypt.compare(senha, hash);
+  return !hashCompativel;
+}
+```
+
+Falta agora inserir a autenticação na base. Adicione o campo `id` no tipo `Usuario`, busque a informação nos locais necessários e troque a atribuição no objeto `autenticacoes` por um INSERT usando Knex:
+
+```ts
+export type Usuario = {
+  id: number;
+  nome: string;
+  login: Login;
+
+...
+
+export async function autenticar (login: Login, senha: Senha): Promise<IdAutenticacao> {
+  const usuario = await knex('usuarios')
+    .select('id', 'login', 'senha', 'nome', 'admin')
+    .where({ login })
+    .first();
+  if (usuario === undefined || (await senhaInvalida(senha, usuario.senha))) {
+    throw new DadosOuEstadoInvalido('Login ou senha inválidos', {
+      codigo: 'CREDENCIAIS_INVALIDAS'
+    });
   }
-  const autenticacao = uuidv4();
+  const id = gerarId();
   await knex('autenticacoes')
-    .insert({ id: autenticacao, id_usuario: usuario.id });
-  return autenticacao;
+    .insert({ id_usuario: usuario.id, id });
+  return id;
 }
+
+...
+
+export async function recuperarUsuarioAutenticado (token: IdAutenticacao): Promise<Usuario> {
+  const usuario = await knex('autenticacoes')
+    .join('usuarios', 'usuarios.id', 'autenticacoes.id_usuario')
+    .select<Usuario>('usuarios.id', 'login', 'senha', 'nome', 'admin')
 ```
 
-Proposta de exercício: adeque o endpoint `PUT /usuarios/logado/nome`. Caso você tenha feito o tratamento de usuário ser ou não admin, agora é a hora de retirar este código.
-
-```js
-export async function alterarNomeDoUsuario (novoNome, login) {
-  if (login === undefined) {
-    throw new UsuarioNaoAutenticado();
-  }
-  if (novoNome === undefined || novoNome === '') {
-    throw new DadosOuEstadoInvalido('CampoObrigatorio', 'Informe o novo nome.');
-  }
-  await knex('usuarios')
-    .update('nome', novoNome);
-}
-```
+[Exercício 02_alterar_nome_usuario](exercicios/02_alterar_nome_usuario/README.md)
 
 Repare que neste momento *todo* o model de usuários está adaptado! Sem uma única mudança necessária na camada de roteamento.
 
@@ -469,19 +521,27 @@ Essa estratégia é bem poderosa, pois permite que exatamente o mesmo script (ou
 O Knex oferece uma ferramenta dessa nativamente, e utilizaremos essa ferramenta a partir de agora. Comece criando um arquivo `knexfile`:
 
 ```sh
-$ ./node_modules/.bin/knex init
+$ npm install --save-dev ts-node
+$ npx knex init -x ts
 ```
 
-Altere o arquivo `knexfile.js` deixando-o dessa forma:
+Altere o arquivo `knexfile.ts` deixando-o dessa forma:
 
-```js
-export const development = {
-  client: 'postgresql',
-  connection: 'postgres://postgres:postgres@localhost:5432/postgres',
-  migrations: {
-    tableName: 'knex_migrations'
-  }
+```ts
+import type { Knex } from 'knex';
+
+const config: { [key: string]: Knex.Config } = {
+  development: {
+    client: 'postgresql',
+    connection: 'postgres://postgres:postgres@localhost:5432/postgres',
+    migrations: {
+      tableName: 'knex_migrations',
+      extension: 'ts',
+    }
+  },
 };
+
+export default config;
 ```
 
 Remova as tabelas `usuarios` e `autenticacoes`. Criaremos elas novamente usando migrations.
@@ -494,36 +554,85 @@ drop table usuarios;
 Crie a primeira migração com o seguinte comando:
 
 ```sh
-$ ./node_modules/.bin/knex --esm migrate:make cria_tabela_usuarios
+$ npx knex migrate:make cria_tabela_usuarios
 ```
 
 Implemente-a com o seguinte código:
 
-```js
-export async function up (knex) {
-  await knex.schema.createTable('usuarios', function (table) {
+```ts
+export async function up(knex: Knex): Promise<void> {
+  await knex.schema.createTable('usuarios', (table) => {
     table.increments();
-    table.text('login').notNullable();
     table.text('nome').notNullable();
+    table.text('login').notNullable();
     table.text('senha').notNullable();
+    table.boolean('admin').notNullable();
   });
-};
+}
 
-export async function down (knex) {
+
+export async function down(knex: Knex): Promise<void> {
   await knex.schema.dropTable('usuarios');
-};
+}
 ```
 
 E execute-a com o seguinte comando:
 
 ```sh
-$ ./node_modules/.bin/knex --esm migrate:latest
+$ npx knex migrate:latest
 ```
 
-É possível usar o comando `down` para reverter o último lote executado:
+Um ponto de atenção aqui: execute `npm run build` e tente executar `npx knex migrate:latest` novamente. O Knex vai reclamar que não consegue criar novamente a tabela de usuários. Isso ocorreu pois ele está tentando executar a versão `.js` das migrações! Você definitivamente não quer isso. Uma maneira de resolver é excluir o arquivo `knexfile.js` gerado pela build, e ignorar tanto o `knexfile.ts` quanto a pasta `migrations` da build coordenada pelo `tsconfig.json`:
 
 ```sh
-$ ./node_modules/.bin/knex --esm migrate:down
+$ rm knexfile.js
+$ rm migrations/*.js
+```
+
+```json
+...
+  },
+  "exclude": ["knexfile.ts", "migrations"]
+}
+```
+
+Essa é uma boa oportunidade para configurar um diretório diferente para os arquivos JavaScript. Também no arquivo `tsconfig.json`:
+
+```json
+    // "outFile": "./",                                  /* Specify a file that bundles all outputs into one JavaScript file. If 'declaration' is true, also designates a file that bundles all .d.ts output. */
+    "outDir": "./build",                                   /* Specify an output folder for all emitted files. */
+    // "removeComments": true,                           /* Disable emitting comments. */
+
+```
+
+Adicione a pasta build no `.gitignore`, no lugar dos arquivos `*.js`:
+
+```
+build
+```
+
+Também é necessário ajustar o script de execução no `package.json`, já que agora os arquivos JavaScript estarão na pasta `build`:
+
+```json
+  "scripts": {
+    "build": "rm -rf build && tsc -p tsconfig.json",
+    "start": "cd build && node app.js"
+  },
+```
+
+Limpe eventuais arquivos existentes e construa o projeto novamente:
+
+```sh
+$ rm -rf node_modules
+$ rm **/*.js
+$ npm install
+$ npm run build
+```
+
+Voltando agora às migrações. É possível usar o comando `down` para reverter o último lote executado:
+
+```sh
+$ npx knex migrate:down
 ```
 
 Uma consideração importante é que alguns projetos decidem *não* oferecer suporte para rollback (o método `down` das migrações). Garantir a qualidade desses módulos é custoso e eles praticamente nunca são usados, portanto o argumento principal é não implementá-los e atuar nos rollbacks manualmente quando algum imprevisto ocorrer nos ambientes produtivos.
@@ -531,54 +640,38 @@ Uma consideração importante é que alguns projetos decidem *não* oferecer sup
 Crie uma migration agora para a tabela `autenticacoes`:
 
 ```sh
-$ ./node_modules/.bin/knex --esm migrate:make criar_tabela_autenticacoes
+$ npx knex migrate:make criar_tabela_autenticacoes
 ```
 
 E implemente-a:
 
 ```js
-export async function up (knex) {
-  await knex.schema.createTable('autenticacoes', function (table) {
+export async function up(knex: Knex): Promise<void> {
+  await knex.schema.table('autenticacoes', (table) => {
     table.uuid('id').primary();
     table.integer('id_usuario').notNullable().references('usuarios.id');
   });
 }
 
-export async function down () {
+
+export async function down(knex: Knex): Promise<void> {
   throw new Error('não suportado');
 }
 ```
 
-Proposta de exercício: crie uma migration para uma tabela de categorias (id auto incremento como chave primária e uma coluna `descricao`, obrigatória, tipo texto).
-
-```sh
-$ ./node_modules/.bin/knex --esm migrate:make criar_tabela_categorias
-```
-
-```js
-export async function up (knex) {
-  await knex.schema.createTable('categorias', function (table) {
-    table.increments();
-    table.text('descricao').notNullable();
-  });
-}
-
-export async function down () {
-  throw new Error('não suportado');
-}
-```
+[Exercício 03_tabela_categorias](exercicios/03_tabela_categorias/README.md)
 
 ## Continuação das adequações
 
-Vamos continuar as adequações, agora focando no model de tarefas. O primeiro passo vai ser adequar o cadastro de tarefa. Comece criando a migração responsável pela tabela:
+Vamos continuar as adequações, agora focando no model de tarefas. Vamos aproveitar o mesmo processo para enriquecer o cadastro com o campo identificador da categoria. Comece criando a migração responsável pela tabela:
 
 ```sh
-$ ./node_modules/.bin/knex --esm migrate:make criar_tabela_tarefas
+$ npx knex migrate:make cria_tabela_tarefas
 ```
 
-```js
-export async function up (knex) {
-  await knex.schema.createTable('tarefas', function (table) {
+```ts
+export async function up(knex: Knex): Promise<void> {
+  await knex.schema.createTable('tarefas', (table) => {
     table.increments();
     table.text('descricao').notNullable();
     table.integer('id_categoria').notNullable().references('categorias.id');
@@ -587,200 +680,193 @@ export async function up (knex) {
   });
 }
 
-export async function down () {
+
+export async function down(knex: Knex): Promise<void> {
   throw new Error('não suportado');
 }
 ```
 
-Adapte agora o método `cadastrarTarefa` dentro do arquivo `tarefas/model.js`:
+Lembre-se de sempre executar as migrações com o comando `npx knex migrate:latest`.
 
-```js
-export async function cadastrarTarefa (tarefa, loginDoUsuario) {
-  if (loginDoUsuario === undefined) {
+Adapte agora o arquivo `tarefas/model.ts`, começando pelas definições de modelo:
+
+```ts
+import knex from '../shared/querybuilder';
+
+import { AcessoNegado, DadosOuEstadoInvalido, UsuarioNaoAutenticado } from '../shared/erros';
+import { Usuario } from '../usuarios/model';
+
+export interface DadosTarefa {
+  descricao: string;
+  id_categoria: number;
+}
+
+type IdTarefa = number;
+
+type Tarefa =
+  DadosTarefa
+  & {
+    id: IdTarefa,
+    id_usuario: number,
+    data_conclusao: Date | null,
+  };
+
+declare module 'knex/types/tables' {
+  interface Tables {
+    tarefas: Tarefa;
+  }
+}
+```
+
+Adapte agora o método `cadastrarTarefa`:
+
+```ts
+export async function cadastrarTarefa(usuario: Usuario | null, dados: DadosTarefa): Promise<IdTarefa> {
+  if (usuario === null) {
     throw new UsuarioNaoAutenticado();
   }
   const res = await knex('tarefas')
     .insert({
-      descricao: tarefa.descricao,
-      id_categoria: tarefa.id_categoria,
-      id_usuario: knex('usuarios').select('id').where('login', loginDoUsuario)
+      ...dados,
+      id_usuario: usuario.id,
     })
-    .returning('id');
-  return res[0];
+    .returning<Pick<Tarefa, 'id'>[]>('id');
+  if (res.length === 0) {
+    throw new Error('Erro ao cadastrar a tarefa. res === undefined');
+  }
+  return res[0].id;
 }
 ```
 
-Adapte também o roteador `tarefas/router.js` adicionando o campo `id_categoria` no schema:
+Adapte também o roteador `tarefas/router.ts` adicionando o campo `id_categoria` no schema:
 
-```js
-const tarefaSchema = {
-  type: 'object',
-  properties: {
-    descricao: { type: 'string' },
-    id_categoria: { type: 'number' }
+```ts
+const postSchema: FastifySchema = {
+  body: {
+    type: 'object',
+    properties: {
+      descricao: { type: 'string' },
+      id_categoria: { type: 'number' },
+    },
+    required: ['descricao', 'id_categoria'],
+    additionalProperties: false,
   },
-  required: [ 'descricao', 'id_categoria' ]
+  response: {
+    201: {
+      type: 'object',
+      properties: {
+        id: { type: 'number' },
+      },
+      required: ['id'],
+    },
+  },
 };
 ```
 
-Proposta de exercício: adeque o endpoint `GET /tarefas/{id}` e depois implemente o endpoint `PATCH /tarefas/{id}`. Este endpoint deve receber uma nova descrição e/ou uma nova categoria e aplicar no registro. Caso você tenha desenvolvido o endpoint que conta as tarefas, adapte-o também.
+Vamos adaptar agora o endpoint `GET /tarefas`. A alteração necessária é no `tarefas/model.ts`:
 
-```js
-export async function buscarTarefa (id, loginDoUsuario) {
-  if (loginDoUsuario === undefined) {
-    throw new UsuarioNaoAutenticado();
-  }
-  const res = await knex('tarefas')
-    .join('usuarios', 'usuarios.id', 'tarefas.id_usuario')
-    .where('tarefas.id', id)
-    .select('usuarios.login', 'tarefas.descricao', 'tarefas.data_conclusao');
-  if (res.length === 0) {
-    throw new DadosOuEstadoInvalido('TarefaNaoEncontrada', 'Tarefa não encontrada.');
-  }
-  const tarefa = res[0];
-  if (tarefa.login !== loginDoUsuario) {
-    throw new AcessoNegado();
-  }
-  return {
-    descricao: tarefa.descricao,
-    concluida: !!tarefa.data_conclusao
-  };
-}
-```
-
-```js
-import { buscarTarefa, cadastrarTarefa, alterarTarefa, concluirTarefa, consultarTarefas, contarTarefasAbertas } from './model.js';
-//...
-const tarefaPatchSchema = {
-  type: 'object',
-  properties: {
-    descricao: { type: 'string' },
-    id_categoria: { type: 'number' }
-  },
-  required: []
-};
-//...
-router.patch('/:id', schemaValidator(tarefaPatchSchema), asyncWrapper(async (req, res) => {
-  const patch = req.body;
-  await alterarTarefa(req.params.id, patch, req.loginDoUsuario);
-  res.sendStatus(204);
-}));
-```
-
-```js
-export async function alterarTarefa (id, patch, loginDoUsuario) {
-  if (loginDoUsuario === undefined) {
-    throw new UsuarioNaoAutenticado();
-  }
-  const res = await knex('tarefas')
-    .join('usuarios', 'usuarios.id', 'tarefas.id_usuario')
-    .where('tarefas.id', id)
-    .select('usuarios.login');
-  if (res.length === 0) {
-    throw new DadosOuEstadoInvalido('TarefaNaoEncontrada', 'Tarefa não encontrada.');
-  }
-  const tarefa = res[0];
-  if (tarefa.login !== loginDoUsuario) {
-    throw new AcessoNegado();
-  }
-  const values = {};
-  if (patch.descricao) values.descricao = patch.descricao;
-  if (patch.id_categoria) values.id_categoria = patch.id_categoria;
-  if (Object.keys(values).length === 0) return;
-  await knex('tarefas')
-    .update(values)
-    .where('id', id);
-}
-```
-
-```js
-export async function contarTarefasAbertas (loginDoUsuario) {
-  if (loginDoUsuario === undefined) {
-    throw new UsuarioNaoAutenticado();
-  }
-  const res = await knex('tarefas')
-    .join('usuarios', 'usuarios.id', 'tarefas.id_usuario')
-    .where('login', loginDoUsuario)
-    .whereNull('data_conclusao')
-    .count('tarefas.id');
-  return parseInt(res[0].count);
-}
-```
-
-Vamos adequar agora o `GET /tarefas`:
-
-```js
-export async function consultarTarefas (termo, loginDoUsuario) {
-  if (loginDoUsuario === undefined) {
+```ts
+export async function consultarTarefas(usuario: Usuario | null, termo?: string): Promise<Tarefa[]> {
+  if (usuario === null) {
     throw new UsuarioNaoAutenticado();
   }
   let query = knex('tarefas')
-    .join('usuarios', 'usuarios.id', 'tarefas.id_usuario')
-    .andWhere('usuarios.login', loginDoUsuario)
-    .select('tarefas.id', 'descricao', 'data_conclusao');
-  if (termo !== undefined && termo !== '') {
+    .select('id', 'descricao', 'id_categoria',
+            'id_usuario', 'data_conclusao', 'descricao'); // sem o await!
+  if (!usuario.admin) {
+    query = query.where('id_usuario', usuario.id);
+  }
+  if (termo) {
     query = query.where('descricao', 'ilike', `%${termo}%`);
   }
-  const res = await query;
-  return res.map(x => ({
-    id: x.id,
-    descricao: x.descricao,
-    concluida: !!x.data_conclusao
-  }));
+  return await query;
 }
 ```
 
-Proposta de exercício: adeque os endpoints `POST /tarefas/{id}/concluir` e `POST /tarefas/{id}/reabrir`.
+Adeque agora a consulta de tarefa por ID. Também no arquivo `tarefas/model.ts`:
 
-```js
-export async function concluirTarefa (id, loginDoUsuario) {
-  if (loginDoUsuario === undefined) {
+```ts
+export async function consultarTarefaPeloId(usuario: Usuario | null, id: IdTarefa): Promise<Tarefa> {
+  if (usuario === null) {
     throw new UsuarioNaoAutenticado();
   }
   const res = await knex('tarefas')
-    .join('usuarios', 'usuarios.id', 'tarefas.id_usuario')
-    .where('tarefas.id', id)
-    .select('usuarios.login');
-  if (res.length === 0) {
-    throw new DadosOuEstadoInvalido('TarefaNaoEncontrada', 'Tarefa não encontrada.');
-  }
-  const tarefa = res[0];
-  if (tarefa.login !== loginDoUsuario) {
-    throw new AcessoNegado();
-  }
-  await knex('tarefas')
-    .update({ data_conclusao: new Date() })
+    .select('id', 'descricao', 'id_categoria',
+            'id_usuario', 'data_conclusao', 'descricao')
     .where('id', id);
+  const tarefa = res[0];
+  if (tarefa === undefined) {
+    throw new DadosOuEstadoInvalido('Tarefa não encontrada', {
+      codigo: 'TAREFA_NAO_ENCONTRADA'
+    });
+  }
+  if (!usuario.admin && usuario.id !== res[0].id_usuario) {
+     throw new AcessoNegado();
+  }
+  return tarefa;
 }
 ```
 
-```js
-export async function reabrirTarefa (id, loginDoUsuario) {
-  if (loginDoUsuario === undefined) {
+Vamos desenvolver agora um novo endpoint: `PATCH /tarefas/{id}`. A ideia é permitir que a descrição e/ou a categoria de uma tarefa existente sejam alteradas. Comece adicionando o endpoint no arquivo `tarefas/router.ts`:
+
+```ts
+import {
+  consultarTarefaPeloId, cadastrarTarefa, consultarTarefas,
+  DadosTarefa, concluirTarefa, reabrirTarefa, alterarTarefa
+} from './model';
+
+...
+
+app.patch('/:id', async (req, resp) => {
+  const { id } = req.params as { id: string };
+  const idTarefa = Number(id);
+  const alteracoes = req.body as Partial<DadosTarefa>;
+  await alterarTarefa(req.usuario, idTarefa, alteracoes);
+  resp.status(204);
+});
+```
+
+E agora implemente a função `alterarTarefa` no arquivo `tarefas/model.ts`:
+
+```ts
+export async function alterarTarefa(usuario: Usuario | null, id: IdTarefa, alteracoes: Partial<DadosTarefa>): Promise<void> {
+  if (usuario === null) {
     throw new UsuarioNaoAutenticado();
   }
-  const res = await knex('tarefas')
-    .join('usuarios', 'usuarios.id', 'tarefas.id_usuario')
-    .where('tarefas.id', id)
-    .select('usuarios.login');
-  if (res.length === 0) {
-    throw new DadosOuEstadoInvalido('TarefaNaoEncontrada', 'Tarefa não encontrada.');
+  await asseguraExistenciaDaTarefaEAcessoDeEdicao(usuario, id);
+  if (Object.keys(alteracoes).length > 0) {
+    await knex('tarefas')
+      .update({
+        descricao: alteracoes.descricao,
+        id_categoria: alteracoes.id_categoria,
+      })
+      .where('id', id);
   }
-  const tarefa = res[0];
-  if (tarefa.login !== loginDoUsuario) {
-    throw new AcessoNegado();
-  }
-  await knex('tarefas')
-    .update({ data_conclusao: null })
-    .where('id', id);
 }
 ```
 
-```js
-router.post('/:id/reabrir', asyncWrapper(async (req, res) => {
-  await reabrirTarefa(req.params.id, req.loginDoUsuario);
-  res.sendStatus(204);
-}));
+O próximo passo será a adaptação dos métodos `concluirTarefa` e `reabrirTarefa`:
+
+```ts
+export async function concluirTarefa(usuario: Usuario | null, id: IdTarefa): Promise<void> {
+  if (usuario === null) {
+    throw new UsuarioNaoAutenticado();
+  }
+  await asseguraExistenciaDaTarefaEAcessoDeEdicao(usuario, id);
+  await knex('tarefas')
+    .update('data_conclusao', new Date())
+    .where('id', id);
+}
+
+export async function reabrirTarefa(usuario: Usuario | null, id: IdTarefa): Promise<void> {
+  if (usuario === null) {
+    throw new UsuarioNaoAutenticado();
+  }
+  await asseguraExistenciaDaTarefaEAcessoDeEdicao(usuario, id);
+  await knex('tarefas')
+    .update('data_conclusao', null)
+    .where('id', id);
+}
 ```
 
 Note que aqui acabaram as adequações! Daqui pra frente serão apenas novos endpoints.
@@ -789,75 +875,36 @@ Note que aqui acabaram as adequações! Daqui pra frente serão apenas novos end
 
 Um endpoint relativamente simples que ficou de fora até agora é a exclusão de uma tarefa. Existem duas abordagens para exclusões: física e lógica. A exclusão física remove mesmo o registro do banco de dados, enquanto a exclusão lógica apenas muda um campo no registro (boolean ou uma data) indicando que ele foi excluído. O benefício da exclusão física é a simplicidade, enquanto o benefício da exclusão lógica é manter um registro melhor dos dados em troca de ter que tomar muito cuidado para limitar todas as consultas que usam essa tabela a desconsiderarem os registros excluídos.
 
-Comece implementando no arquivo `tarefas/router.js`:
+Comece implementando no arquivo `tarefas/router.ts`:
 
-```js
-router.delete('/:id', asyncWrapper(async (req, res) => {
-  await deletarTarefa(req.params.id, req.loginDoUsuario);
-  res.sendStatus(204);
-}));
+```ts
+import {
+  consultarTarefaPeloId, cadastrarTarefa, consultarTarefas,
+  DadosTarefa, concluirTarefa, reabrirTarefa, alterarTarefa,
+  excluirTarefa
+} from './model';
+
+...
+
+app.delete('/:id', async (req, resp) => {
+  const { id } = req.params as { id: string };
+  const idTarefa = Number(id);
+  await excluirTarefa(req.usuario, idTarefa);
+  resp.status(204);
+});
 ```
 
-E depois adicione o método no `tarefas/model.js`:
+E depois adicione o método no `tarefas/model.ts`:
 
-```js
-export async function deletarTarefa (id, loginDoUsuario) {
-  if (loginDoUsuario === undefined) {
+```ts
+export async function excluirTarefa(usuario: Usuario | null, id: IdTarefa): Promise<void> {
+  if (usuario === null) {
     throw new UsuarioNaoAutenticado();
   }
-  const res = await knex('tarefas')
-    .join('usuarios', 'usuarios.id', 'tarefas.id_usuario')
-    .where('tarefas.id', id)
-    .select('usuarios.login');
-  if (res.length === 0) {
-    throw new DadosOuEstadoInvalido('TarefaNaoEncontrada', 'Tarefa não encontrada.');
-  }
-  const tarefa = res[0];
-  if (tarefa.login !== loginDoUsuario) {
-    throw new AcessoNegado();
-  }
+  await asseguraExistenciaDaTarefaEAcessoDeEdicao(usuario, id);
   await knex('tarefas')
     .delete()
     .where('id', id);
-}
-```
-
-Note que temos algumas oportunidades de refatoração nesse model. O código que busca uma tarefa apenas para validar o acesso está sendo utilizado em muitos lugares e vale ser extraído:
-
-```js
-export async function alterarTarefa (id, patch, loginDoUsuario) {
-  await assegurarExistenciaEAcesso(id, loginDoUsuario);
-  const values = {};
-  if (patch.descricao) values.descricao = patch.descricao;
-  if (patch.id_categoria) values.id_categoria = patch.id_categoria;
-  if (Object.keys(values).length === 0) return;
-  await knex('tarefas')
-    .update(values)
-    .where('id', id);
-}
-
-export async function deletarTarefa (id, loginDoUsuario) {
-  await assegurarExistenciaEAcesso(id, loginDoUsuario);
-  await knex('tarefas')
-    .delete()
-    .where('id', id);
-}
-
-async function assegurarExistenciaEAcesso (idTarefa, loginDoUsuario) {
-  if (loginDoUsuario === undefined) {
-    throw new UsuarioNaoAutenticado();
-  }
-  const res = await knex('tarefas')
-    .join('usuarios', 'usuarios.id', 'tarefas.id_usuario')
-    .where('tarefas.id', idTarefa)
-    .select('usuarios.login');
-  if (res.length === 0) {
-    throw new DadosOuEstadoInvalido('TarefaNaoEncontrada', 'Tarefa não encontrada.');
-  }
-  const tarefa = res[0];
-  if (tarefa.login !== loginDoUsuario) {
-    throw new AcessoNegado();
-  }
 }
 ```
 
@@ -868,81 +915,124 @@ Vamos implementar agora o vínculo de etiquetas com as tarefas. Note que o endpo
 Começaremos implementando uma versão ingênua e depois vamos evoluí-la, incorporando conceitos que resolvem o problema. O primeiro passo é criar a tabela de etiqueta e uma tabela que representa as etiquetas vinculadas com as tarefas:
 
 ```sh
-$ ./node_modules/.bin/knex --esm migrate:make criar_tabela_etiquetas_e_tarefa_etiqueta
+$ npx knex migrate:make cria_tabela_etiquetas_e_tarefa_etiqueta
 ```
 
-```js
-export async function up (knex) {
-  await knex.schema.createTable('etiquetas', function (table) {
+```ts
+export async function up(knex: Knex): Promise<void> {
+  await knex.schema.createTable('etiquetas', (table) => {
     table.increments();
-    table.text('descricao').notNullable();
-    table.text('cor').notNullable();
+    table.text('descricao').notNullable().unique();
+    table.specificType('cor', 'integer[3]').notNullable();
   });
-  await knex.schema.createTable('tarefa_etiqueta', function (table) {
-    table.integer('id_tarefa').references('tarefas.id');
-    table.integer('id_etiqueta').references('etiquetas.id');
+  await knex.schema.createTable('tarefa_etiqueta', (table) => {
+    table.integer('id_tarefa').notNullable().references('tarefas.id');
+    table.integer('id_etiqueta').notNullable().references('etiquetas.id');
     table.primary(['id_tarefa', 'id_etiqueta']);
   });
 }
 
-export async function down () {
+
+export async function down(knex: Knex): Promise<void> {
   throw new Error('não suportado');
 }
 ```
 
-Crie agora uma pasta chamada `etiquetas`, com um arquivo chamado `model.js` dentro dela com o seguinte conteúdo:
+Crie agora uma pasta chamada `etiquetas`, com um arquivo chamado `model.ts` dentro dela com o seguinte conteúdo:
 
-```js
-import knex from '../querybuilder.js';
+```ts
+import knex from '../shared/querybuilder';
 
-export async function cadastrarEtiquetaSeNecessario (descricao) {
-  let res = await knex('etiquetas')
-    .select('id')
-    .where('descricao', descricao);
-  if (res.length === 0) {
-    res = await knex('etiquetas')
-      .insert({
-        descricao,
-        cor: gerarCorAleatoria()
-      })
-      .returning('id');
-    return res[0];
-  } else {
-    return res[0].id;
+type FatorRGB = number; // 0-255
+type Cor = [FatorRGB, FatorRGB, FatorRGB];
+
+type Etiqueta = {
+  id: number;
+  descricao: string;
+  cor: Cor;
+}
+
+declare module 'knex/types/tables' {
+  interface Tables {
+    etiquetas: Etiqueta;
   }
 }
 
-function gerarCorAleatoria () {
+export async function cadastrarEtiquetaSeNecessario(etiqueta: string): Promise<number> {
+  const res = await knex('etiquetas')
+    .select('id')
+    .where('descricao', etiqueta)
+    .first();
+  let id: number;
+  if (res !== undefined) {
+    id = res.id;
+  } else {
+    const res = await knex('etiquetas')
+      .insert({
+        descricao: etiqueta,
+        cor: gerarCorAleatoria()
+      })
+      .returning<{ id: number }[]>('id');
+    id = res[0].id;
+  }
+  return id;
+}
+
+function gerarCorAleatoria(): Cor {
   const num = Math.round(0xffffff * Math.random());
   const r = num >> 16;
   const g = num >> 8 & 255;
   const b = num & 255;
-  return `rgb(${r}, ${g}, ${b})`;
+  return [r, g, b];
 }
 ```
 
 Adicione agora o seguinte método no modelo de tarefas:
 
-```js
-export async function vincularEtiqueta (idTarefa, etiqueta, loginDoUsuario) {
-  await assegurarExistenciaEAcesso(idTarefa, loginDoUsuario);
+```ts
+import { cadastrarEtiquetaSeNecessario } from '../etiquetas/model';
+
+...
+
+export async function vincularEtiquetaNaTarefa(usuario: Usuario | null, id: IdTarefa, etiqueta: string): Promise<void> {
+  if (usuario === null) {
+    throw new UsuarioNaoAutenticado();
+  }
+  await asseguraExistenciaDaTarefaEAcessoDeEdicao(usuario, id);
   const idEtiqueta = await cadastrarEtiquetaSeNecessario(etiqueta);
   await knex('tarefa_etiqueta')
     .insert({
-      id_tarefa: idTarefa,
-      id_etiqueta: idEtiqueta
+      id_tarefa: id,
+      id_etiqueta: idEtiqueta,
     })
-    .onConflict().ignore();
+    .onConflict(['id_tarefa', 'id_etiqueta']).ignore();
 }
 ```
 
 E por fim o endpoint no router de tarefas:
 
+```ts
+import {
+  consultarTarefaPeloId, cadastrarTarefa, consultarTarefas,
+  DadosTarefa, concluirTarefa, reabrirTarefa, alterarTarefa,
+  excluirTarefa, vincularEtiquetaNaTarefa
+} from './model';
+
+...
+
+app.post('/:id/etiquetas/:etiqueta', async (req, resp) => {
+  const { id, etiqueta } = req.params as { id: string, etiqueta: string };
+  const idTarefa = Number(id);
+  await vincularEtiquetaNaTarefa(req.usuario, idTarefa, etiqueta);
+  resp.status(204);
+});
+```
+
+Nota: é possível passar caracteres especiais dessa forma. Basta passar o resultado da chamada JavaScript `encodeURIComponent(etiquetaComCaracteresEspeciais)`. Por exemplo:
+
 ```js
-router.post('/:id/etiquetas', schemaValidator(vincularEtiquetaSchema), asyncWrapper(async (req, res) => {
-  await vincularEtiqueta(req.params.id, req.body.etiqueta, req.loginDoUsuario);
-  res.sendStatus(204);
-}));
+> encodeURIComponent("grupo/item")
+< 'grupo%2Fitem'
 ```
 
 Pare um momento e analise o que ocorre se o código que insere o vínculo entre tarefa e etiqueta falhar. Você pode ter chegado à conclusão que a etiqueta vai permanecer cadastrada. Isso ocorre pois o endpoint não está se comportando de maneira atômica. Neste caso pode parecer inofensivo, mas nem sempre será assim (pense em uma situação mais complicada envolvendo por exemplo saques e depósitos bancários).
@@ -951,71 +1041,97 @@ Sistemas de gerenciamento de bancos de dados relacionais trazem um mecanismo que
 
 O Knex oferece transações através dos métodos `knex.transaction(async trx => {})` e `knex.transacting(trx)`. O primeiro cria uma transação e, ao final da promise, faz o commit ou rollback dependendo do fato de ter ocorrido algum erro ou não. O método `transacting` permite que uma operação entre em uma `trx` existente. A instância `trx` se comporta como um objeto `knex`, ou seja é possível chamar `select`, `insert` etc direto nela.
 
-Com base nisso qual seria a melhor maneira de desenhar o suporte a transações no nosso model? Lembre-se que queremos que garantir que todas as operações chamadas para atender determinada requisição participem da mesma transação. Existe um padrão de projeto muito bom nessas horas que é o `Unit of Work`. A ideia é criar um objeto que acompanha toda a chamada ao redor da camada de modelo, e esse objeto é usado sempre que uma operação de banco de dados precisa descobrir qual transação participar. Comece criando o seguinte método no arquivo `querybuilder.js`:
+Com base nisso qual seria a melhor maneira de desenhar o suporte a transações no nosso model? Lembre-se que queremos que garantir que todas as operações chamadas para atender determinada requisição participem da mesma transação. Existe um padrão de projeto muito bom nessas horas que é o `Unit of Work`. A ideia é criar um objeto que acompanha toda a chamada ao redor da camada de modelo, e esse objeto é usado sempre que uma operação de banco de dados precisa descobrir qual transação participar. Comece instalando a biblioteca `fastify-plugin`:
 
-```js
-export function comUnidadeDeTrabalho () {
-  return function (req, res, next) {
-    knex.transaction(function (trx) {
-      res.on('finish', function () {
-        if (res.statusCode < 200 || res.statusCode > 299) {
-          trx.rollback();
-        } else {
-          trx.commit();
-        }
-      });
+```sh
+$ npm i fastify-plugin
+```
+
+Agora crie um arquivo chamado `core/uow.ts`:
+
+```ts
+import { FastifyInstance } from 'fastify';
+import fastifyPlugin from 'fastify-plugin';
+
+import knex from '../shared/querybuilder';
+
+
+export default fastifyPlugin(async (app: FastifyInstance) => {
+  app.decorateRequest('uow', null);
+
+  app.addHook('preHandler', (req, _, done) => {
+    knex.transaction(trx => {
       req.uow = trx;
-      next();
+      done();
     });
+  });
+
+  app.addHook('onSend', async (req) => {
+    if (!req.uow.isCompleted()) {
+      console.log('commit');
+      await req.uow.commit();
+    }
+  });
+
+  app.addHook('onError', async (req) => {
+    console.log('rollback');
+    await req.uow.rollback();
+  });
+
+});
+```
+
+Instale-o no arquivo `app.ts`:
+
+```ts
+import uowPlugin from './core/uow';
+
+...
+
+app.decorateRequest('usuario', null);
+app.register(uowPlugin);
+```
+
+A ideia aqui é enriquecer as requisições que chegam no Fastify com uma transação Knex. Ao final da requisição, se tudo deu certo, efetuamos um commit, caso contrário, um rollback é emitido.
+
+A partir desse ponto *todas* as rotas e *todos* os métodos da camada de modelo precisam ser ajustados da seguinte forma:
+
+1. Passar `req.uow` como último parâmetro em todas as chamadas para a camada de modelo.
+2. Receber `uow: Knex` na definição dos métodos da camada de modelo e usá-lo no lugar do `knex`.
+
+Exemplo para o vínculo de etiqueta:
+
+```ts
+app.post('/:id/etiquetas/:etiqueta', async (req, resp) => {
+  const { id, etiqueta } = req.params as { id: string, etiqueta: string };
+  const idTarefa = Number(id);
+  await vincularEtiquetaNaTarefa(req.usuario, idTarefa, etiqueta, req.uow);
+  resp.status(204);
+});
+```
+
+```ts
+export async function vincularEtiquetaNaTarefa(
+  usuario: Usuario | null, id: IdTarefa,
+  etiqueta: string, uow: Knex
+): Promise<void> {
+  if (usuario === null) {
+    throw new UsuarioNaoAutenticado();
   }
-}
-```
-
-Use esse middleware customizado no endpoint de cadastro de etiqueta, e passe a unidade de trabalho pra dentro da camada de modelo:
-
-```js
-router.post('/:id/etiquetas', schemaValidator(vincularEtiquetaSchema), comUnidadeDeTrabalho(), asyncWrapper(async (req, res) => {
-  await vincularEtiqueta(req.params.id, req.body.etiqueta, req.loginDoUsuario, req.uow);
-  res.sendStatus(204);
-}));
-```
-
-E por fim use nos dois arquivos de modelo impactados:
-
-```js
-export async function vincularEtiqueta (idTarefa, etiqueta, loginDoUsuario, uow) {
-  await assegurarExistenciaEAcesso(idTarefa, loginDoUsuario);
+  await asseguraExistenciaDaTarefaEAcessoDeEdicao(usuario, id, uow);
   const idEtiqueta = await cadastrarEtiquetaSeNecessario(etiqueta, uow);
-  await knex('tarefa_etiqueta')
-    .transacting(uow)
+  await uow('tarefa_etiqueta')
     .insert({
-      id_tarefa: idTarefa,
-      id_etiqueta: idEtiqueta
+      id_tarefa: id,
+      id_etiqueta: idEtiqueta,
     })
-    .onConflict().ignore();
+    .onConflict(['id_tarefa', 'id_etiqueta']).ignore();
 }
 ```
 
-```js
-export async function cadastrarEtiquetaSeNecessario (descricao, uow) {
-  let res = await knex('etiquetas')
-    .transacting(uow)
-    .select('id')
-    .where('descricao', descricao);
-  if (res.length === 0) {
-    res = await knex('etiquetas')
-      .transacting(uow)
-      .insert({
-        descricao,
-        cor: gerarCorAleatoria()
-      })
-      .returning('id');
-    return res[0];
-  } else {
-    return res[0].id;
-  }
-}
-```
+(note que o código acima assume que o mesmo já foi feito para os métodos `asseguraExistenciaDaTarefaEAcessoDeEdicao` e `cadastrarEtiquetaSeNecessario`).
+
+Dica: remova todos os imports do tipo `import knex from '../shared/querybuilder'` dos arquivos `model.ts`. Eles não devem mais ser utilizados já que todas as chamadas devem ser feitas usando a instância `uow`, e não mais diretamente usando a instância `knex` exposta no módulo `querybuilder.ts`.
 
 Existem outras abordagens além da unidade de trabalho para compartilhamento de transação na camada de modelo:
 
@@ -1024,189 +1140,93 @@ Existem outras abordagens além da unidade de trabalho para compartilhamento de 
 
 Um enorme benefício da unidade de trabalho, como veremos adiante, é a facilidade com que ela permite a implementação de testes unitários e de integração.
 
-Proposta de exercício: implemente o endpoint `DELETE /tarefas/{id}/etiquetas/{etiqueta}`. Receba descrição e não o ID. Para o front end não queremos expor a chave primária da tabela de etiquetas. Se for o único uso da etiqueta, remova-a. Coloque tudo isso em uma unidade de trabalho.
+Vamos implementar agora o endpoint `DELETE /tarefas/:id/etiquetas/:etiqueta`. Note que, se for a última utilização da etiqueta, queremos excluí-la! Comece adicionando duas funções no arquivo `etiquetas/model.ts`: `removerEtiquetaSeObsoleta` e `buscarIdDaEtiquetaPelaDescricao`:
 
-```js
-router.delete('/:id/etiquetas/:descricao', comUnidadeDeTrabalho(), asyncWrapper(async (req, res) => {
-  await desvincularEtiqueta(req.params.id, req.params.descricao, req.loginDoUsuario, req.uow);
-  res.sendStatus(204);
-}));
+```ts
+import { DadosOuEstadoInvalido } from '../shared/erros';
+
+...
+
+export async function buscarIdDaEtiquetaPelaDescricao(
+  descricao: string, uow: Knex
+): Promise<number> {
+  const res = await uow('etiquetas')
+    .select('id')
+    .where('descricao', descricao)
+    .first();
+  if (res === undefined) {
+    throw new DadosOuEstadoInvalido('Etiqueta não encontrada', {
+      codigo: 'ETIQUETA_NAO_ENCONTRADA'
+    });
+  }
+  return res.id;
+}
+
+export async function removerEtiquetaSeObsoleta(
+  id: number, uow: Knex
+): Promise<void> {
+  // pequena dependência circular aqui
+  // visto que o conceito de etiquetas
+  // está dependendo do conceito de tarefas
+  const res = await uow('tarefa_etiqueta')
+    .count('id_tarefa')
+    .where('id_etiqueta', id)
+    .first();
+  // infelizmente esse count é uma string e não um number
+  if (res === undefined || res.count === '0') {
+    await uow('etiquetas')
+      .where('id', id)
+      .delete();
+  }
+}
 ```
 
-```js
-export async function desvincularEtiqueta (idTarefa, etiqueta, loginDoUsuario, uow) {
-  await assegurarExistenciaEAcesso(idTarefa, loginDoUsuario);
-  const idEtiqueta = await buscarIdEtiquetaPelaDescricao (etiqueta, uow);
-  await knex('tarefa_etiqueta')
-    .transacting(uow)
+Adicione agora a função `desvincularEtiquetaDaTarefa` no arquivo `tarefas/model.ts`:
+
+```ts
+import {
+  cadastrarEtiquetaSeNecessario, buscarIdDaEtiquetaPelaDescricao,
+  removerEtiquetaSeObsoleta
+} from '../etiquetas/model';
+
+...
+
+export async function desvincularEtiquetaDaTarefa(
+  usuario: Usuario | null, id: IdTarefa,
+  etiqueta: string, uow: Knex
+): Promise<void> {
+  if (usuario === null) {
+    throw new UsuarioNaoAutenticado();
+  }
+  await asseguraExistenciaDaTarefaEAcessoDeEdicao(usuario, id, uow);
+  const idEtiqueta = await buscarIdDaEtiquetaPelaDescricao(etiqueta, uow);
+  await uow('tarefa_etiqueta')
     .delete()
     .where({
-      id_tarefa: idTarefa,
-      id_etiqueta: idEtiqueta
+      id_tarefa: id,
+      id_etiqueta: idEtiqueta,
     });
   await removerEtiquetaSeObsoleta(idEtiqueta, uow);
 }
 ```
 
-```js
-export async function removerEtiquetaSeObsoleta (idEtiqueta, uow) {
-  const res = await knex('tarefa_etiqueta')
-    .transacting(uow)
-    .count('id_tarefa')
-    .where('id_etiqueta', idEtiqueta);
-  if (parseInt(res[0].count) === 0) {
-    await knex('etiquetas')
-      .transacting(uow)
-      .delete()
-      .where('id', idEtiqueta);
-  }
-}
+E por fim exponha o endpoint no arquivo `tarefas/router.ts`:
 
-export async function buscarIdEtiquetaPelaDescricao (descricao, uow) {
-  const res = await knex('etiquetas')
-    .transacting(uow)
-    .select('id')
-    .where('descricao', descricao);
-  if (res.length === 0) {
-    throw new DadosOuEstadoInvalido('EtiquetaNaoExiste', 'Etiqueta não existe.');
-  }
-  return res[0].id;
-}
+```ts
+import {
+  consultarTarefaPeloId, cadastrarTarefa, consultarTarefas,
+  DadosTarefa, concluirTarefa, reabrirTarefa, alterarTarefa,
+  excluirTarefa, vincularEtiquetaNaTarefa, desvincularEtiquetaDaTarefa
+} from './model';
+
+...
+
+app.delete('/:id/etiquetas/:etiqueta', async (req, resp) => {
+  const { id, etiqueta } = req.params as { id: string, etiqueta: string };
+  const idTarefa = Number(id);
+  await desvincularEtiquetaDaTarefa(req.usuario, idTarefa, etiqueta, req.uow);
+  resp.status(204);
+});
 ```
 
-## Alguns endpoints de suporte e adaptação do GET /tarefas
-
-Para aliviar um pouco a teoria vamos adicionar um endpoint de suporte: o `GET /etiquetas`. O frontend vai utilizar este endpoint para obter as cores das etiquetas.
-
-Comece implementando um método `buscarEtiquetas` no arquivo `etiquetas/model.js`:
-
-```js
-export async function buscarEtiquetas (uow) {
-  return await knex('etiquetas')
-    .transacting(uow)
-    .select('descricao', 'cor');
-}
-```
-
-Crie um `etiquetas/router.js`:
-
-```js
-import express from 'express';
-
-import asyncWrapper from '../async-wrapper.js';
-import { comUnidadeDeTrabalho } from '../querybuilder.js';
-import { buscarEtiquetas } from './model.js';
-
-const router = express.Router();
-
-router.get('', comUnidadeDeTrabalho(), asyncWrapper(async (req, res) => {
-  const etiquetas = await buscarEtiquetas(req.uow);
-  res.send(etiquetas);
-}));
-
-export default router;
-```
-
-Não se esqueça de instalar o novo router no `app.js`:
-
-```js
-//...
-import tarefasRouter from './tarefas/router.js';
-import etiquetasRouter from './etiquetas/router.js';
-//...
-app.use('/usuarios', usuariosRouter);
-
-app.use('/etiquetas', etiquetasRouter);
-
-app.use((_req, res) => {
-//...
-```
-
-Proposta de exercício: implemente agora o `GET /categorias`.
-
-```js
-import express from 'express';
-
-import asyncWrapper from '../async-wrapper.js';
-import { comUnidadeDeTrabalho } from '../querybuilder.js';
-import { buscarCategorias } from './model.js';
-
-const router = express.Router();
-
-router.get('', comUnidadeDeTrabalho(), asyncWrapper(async (req, res) => {
-  const categorias = await buscarCategorias(req.uow);
-  res.send(categorias);
-}));
-
-export default router;
-```
-
-```js
-import knex from '../querybuilder.js';
-
-export async function buscarCategorias (uow) {
-  return await knex('categorias')
-    .transacting(uow)
-    .select('id', 'descricao');
-}
-```
-
-```js
-app.use('/categorias', categoriasRouter);
-```
-
-Neste ponto podemos aproveitar para retornar as etiquetas da tarefa no endpoint `GET /tarefas`. Para isso adapte o método `consultarTarefas` no arquivo `tarefas/model.js`:
-
-```js
-export async function consultarTarefas (termo, loginDoUsuario) {
-  if (loginDoUsuario === undefined) {
-    throw new UsuarioNaoAutenticado();
-  }
-  let query = knex('tarefas')
-    .join('usuarios', 'usuarios.id', 'tarefas.id_usuario')
-    .andWhere('usuarios.login', loginDoUsuario)
-    .select('tarefas.id', 'descricao', 'data_conclusao');
-  if (termo !== undefined && termo !== '') {
-    query = query.where('descricao', 'ilike', `%${termo}%`);
-  }
-  const res = await query;
-
-  const idsTarefa = res.map(x => x.id);
-  const resEtiquetas = await knex('tarefa_etiqueta')
-    .join('etiquetas', 'etiquetas.id', 'tarefa_etiqueta.id_etiqueta')
-    .select('id_tarefa', 'etiquetas.descricao', 'etiquetas.cor')
-    .whereIn('tarefa_etiqueta.id_tarefa', idsTarefa);
-  const mapaEtiquetas = {};
-  for (const vinculo of resEtiquetas) {
-    const idTarefa = vinculo.id_tarefa;
-    if (mapaEtiquetas[idTarefa] === undefined) {
-      mapaEtiquetas[idTarefa] = [];
-    }
-    mapaEtiquetas[idTarefa].push({
-      etiqueta: vinculo.descricao,
-      cor: vinculo.cor
-    });
-  }
-
-  return res.map(x => ({
-    id: x.id,
-    descricao: x.descricao,
-    concluida: !!x.data_conclusao,
-    etiquetas: mapaEtiquetas[x.id] || []
-  }));
-}
-```
-
-Proposta de exercício: corrija a exclusão de tarefa com etiquetas. Bônus: limpe as etiquetas obsoletas.
-
-```js
-export async function deletarTarefa (id, loginDoUsuario) {
-  await assegurarExistenciaEAcesso(id, loginDoUsuario);
-  await knex('tarefa_etiqueta')
-    .delete()
-    .where('id_tarefa', id);
-  await knex('tarefas')
-    .delete()
-    .where('id', id);
-}
-```
+[Exercício 04_endpoints_de_suporte](exercicios/04_endpoints_de_suporte/README.md)
