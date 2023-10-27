@@ -8,7 +8,7 @@
     "start": "node app.js"
   },
   "devDependencies": {
-    "@types/node": "^18.16.18",
+    "@types/node": "^18.16.19",
     "typescript": "^5.1.3"
   }
 }
